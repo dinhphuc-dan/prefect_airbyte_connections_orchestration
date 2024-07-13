@@ -1,0 +1,173 @@
+{%- set list_connection_name = [] -%}
+{%- set list_connection_name_group_remain = [] -%}
+
+import asyncio
+from prefect import flow, task
+from prefect.filesystems import GitHub
+from prefect_airbyte.server import AirbyteServer
+from prefect_airbyte.connections import trigger_sync
+from prefect.blocks.notifications import SlackWebhook
+from prefect.deployments import Deployment
+import os
+import logging
+import argparse
+import requests
+
+# create a custom logger instead of using prefect logger
+custom_logger = logging.getLogger('custom')
+custom_logger.addHandler(logging.StreamHandler())
+custom_logger.setLevel(logging.INFO)
+custom_logger.propagate = False
+
+# basic setup for argument throug command line for local testing and development
+_parser=argparse.ArgumentParser()
+_parser.add_argument("--deploy")
+_args=_parser.parse_args()
+
+# load repo information from prefect or ENV, below infomation is immutable. DONT CHANGE
+airbyte_username = os.getenv('AIRBYTE_USERNAME')
+airbyte_password = os.getenv('AIRBYTE_PASSWORD')
+airbyte_server_host = os.getenv('AIRBYTE_SERVER_HOST')
+discord_webhook_link = ' https://discord.com/api/webhooks/1257918204592918579/wjnyRt7hDBoiJaBoK-yP-JXL7he2sLH-KxRdYZII9rlKzoUtVT-ton1Fd3Uz8J0B9BIh'
+
+list_app_and_connection_dict = [
+    {%- for i in list_app_and_connection %}
+    {{i}}
+    {%- if not loop.last -%} ,
+    {%- endif %}
+    {%- endfor %}
+]
+
+""" get info from block in prefect cloud """
+_prefect_agent_airbyte_github = GitHub.load("{{prefect_agent_airbyte_github_name}}")
+
+""" basic task for slack noti"""
+@task(name = "Slack Noti")
+async def slack_noti(text_input):
+    slack_webhook_block = await SlackWebhook.load("{{slack_channel}}")
+    await slack_webhook_block.notify(f"{text_input}")
+
+#""" base flow """
+{%- for i in list_app_and_connection -%}
+{%- for k,v in i.items() %}
+@flow(name="{{k}}")
+async def {{ 'base_flow_' ~ k ~ '()'}}:
+    airbyte_server = AirbyteServer(
+        username=airbyte_username,
+        password=airbyte_password,
+        server_host=airbyte_server_host,
+    )
+    await trigger_sync(
+        airbyte_server=airbyte_server,
+        connection_id="{{v}}",
+        poll_interval_s=60,
+        status_updates=False,
+        timeout=3600
+    )
+{%- do list_connection_name.append('base_flow_' ~ k ~ '()') -%}
+{%- endfor %}
+{% endfor %}
+
+#""" add base flow into sub_flow"""
+{% set x = 6 -%}
+{%- set number_sub_flow_remain_of_division_by_x = list_connection_name | length % x -%}
+{%- set number_sub_flow_interger_division_by_x = list_connection_name | length // x -%}
+
+
+{%- if number_sub_flow_interger_division_by_x == 0 -%}
+
+
+@flow(name="sub_flow_1")
+async def sub_flow_1():
+    parallel_base_flows = [ {{ list_connection_name | join(",") }} ]
+    await asyncio.gather(*parallel_base_flows)
+
+
+{%- elif number_sub_flow_remain_of_division_by_x == 0 -%}
+
+
+{%- for n in range(1, (number_sub_flow_interger_division_by_x + 1 ), 1) -%}
+{%- set list_connection_name_group = [] -%}
+{%- for j in range((n -1)*x, (n * x), 1) -%}
+{%- do list_connection_name_group.append(list_connection_name[j]) -%}
+{%- endfor -%}
+@flow(name="{{'sub_flow_' ~n}}"
+)
+async def {{ 'sub_flow_' ~n~ '()'}}:
+    parallel_base_flows = [ {{ list_connection_name_group | join(",") }} ]
+    await asyncio.gather(*parallel_base_flows)
+{% endfor -%}
+
+
+{%- else -%}
+
+
+{%- for n in range(1, (number_sub_flow_interger_division_by_x + 1 ), 1) -%}
+{%- set list_connection_name_group = [] -%}
+{%- for j in range((n -1)*x, (n * x), 1) -%}
+{%- do list_connection_name_group.append(list_connection_name[j]) -%}
+{%- endfor -%}
+@flow(name="{{'sub_flow_' ~n}}"
+)
+async def {{ 'sub_flow_' ~n~ '()'}}:
+    parallel_base_flows = [ {{ list_connection_name_group | join(",") }} ]
+    await asyncio.gather(*parallel_base_flows)
+{% endfor -%}
+{% for i in range( 1 ,(number_sub_flow_remain_of_division_by_x + 1), 1) %}
+{%- do list_connection_name_group_remain.append(list_connection_name[( number_sub_flow_interger_division_by_x * x + i - 1)]) -%}
+{% endfor -%}
+@flow(name="{{'sub_flow_' ~(number_sub_flow_interger_division_by_x + 1)}}"
+)
+async def {{ 'sub_flow_' ~(number_sub_flow_interger_division_by_x + 1)~ '()'}}:
+    parallel_base_flows = [ {{ list_connection_name_group_remain | join(",") }} ]
+    await asyncio.gather(*parallel_base_flows)
+
+{%- endif %}
+
+#""" add sub_flow into one main flow"""
+@flow()
+async def {{ flow_name }}():
+    try: 
+        {% if number_sub_flow_remain_of_division_by_x == 0 -%}
+
+        {%- for i in  range(1, number_sub_flow_interger_division_by_x + 1, 1) %}
+        await slack_noti(f"*AIRBYTE* \n Flow *{{flow_name}}*, *{{'sub_flow_'~ i ~'()' }}* start running")
+        await {{'sub_flow_'~ i ~'()' }}
+        await slack_noti(f"*AIRBYTE* \n Complete *{{flow_name}}*, *{{'sub_flow_'~ i ~'()' }}*")
+        {%- endfor -%}
+
+        {%- else -%}
+
+        {%- for i in  range(1, number_sub_flow_interger_division_by_x + 2, 1) %}
+        await slack_noti(f"*AIRBYTE* \n Flow *{{flow_name}}*, *{{'sub_flow_'~ i ~'()' }}* start running")
+        await {{'sub_flow_'~ i ~'()' }}
+        await slack_noti(f"*AIRBYTE* \n Complete *{{flow_name}}*, *{{'sub_flow_'~ i ~'()' }}*")
+        {%- endfor -%}
+
+        {%- endif %}
+        await slack_noti(f"*AIRBYTE* :sparkle: :sparkle: :sparkle: :sparkle: :sparkle: :sparkle: \n Run *Succeeded* on flow *{{flow_name}}* :money_mouth_face: :smile:!")
+        {% if flow_name != 'airbyte_connection_pion_main_flow' -%}
+        requests.request(method = 'POST', url=discord_webhook_link, json ={ "username": "Data-bot", "content": f"Call data COMPLETED on **{{flow_name}}**"})
+        {%- endif %}
+    except Exception as e:
+        await slack_noti(f"*AIRBYTE* :no_entry: :no_entry: :no_entry: :no_entry: :no_entry: :no_entry: \n Run *FAILED* on flow *{{flow_name}}* :upside_down_face: :melting_face: \n *Error as:* \n {repr(e)}")
+        {% if flow_name != 'airbyte_connection_pion_main_flow' -%}
+        requests.request(method = 'POST', url=discord_webhook_link, json ={ "username": "Data-bot", "content": f"Call data FAILED on **{{flow_name}}**"})
+        {%- endif %}
+
+def deploy_to_prefect_flow_{{ flow_name }}():
+    Deployment.build_from_flow(
+            flow={{flow_name}},
+            name="{{prefect_deployement_name}}",
+            apply=True,
+            work_queue_name="COMPANY_PC_AIRBYTE",
+            storage=_prefect_agent_airbyte_github
+        )
+    custom_logger.info(f"Deploy {{flow_name}} successfully! Please check in Prefect Cloud UI")
+
+
+if __name__ == "__main__":
+    if _args.deploy == 'true':
+        deploy_to_prefect_flow_{{ flow_name }}()
+    else:
+        main_flow_state = asyncio.run({{ flow_name }})
